@@ -457,73 +457,104 @@ export default function App() {
   }
 
   function updateAuthForm(event) {
-    setAuthForm({
-      ...authForm,
-      [event.target.name]: event.target.value,
-    });
+  const { name, value } = event.target;
+
+  if (name === "full_name") {
+    const cleanValue = value.replace(/[^a-zA-Z ]/g, "");
+
+    setAuthForm((previous) => ({
+      ...previous,
+      full_name: cleanValue,
+    }));
+
+    return;
   }
+
+  setAuthForm((previous) => ({
+    ...previous,
+    [name]: value,
+  }));
+}
 
   async function handleAuth(event) {
-    event.preventDefault();
-    setAuthError("");
-    setAuthLoading(true);
+  event.preventDefault();
+  setAuthError("");
 
-    try {
-      if (authMode === "register" || authMode === "rescue-register") {
-        const rescue = authMode === "rescue-register";
+  // Name validation for both registration forms
+  if (authMode !== "login") {
+    const name = authForm.full_name.trim();
 
-        const payload = {
-          full_name: authForm.full_name,
-          email: authForm.email,
-          password: authForm.password,
-        };
+    if (!/^[A-Za-z]+(?: [A-Za-z]+)*$/.test(name)) {
+      setAuthError("Name must contain only alphabets and spaces.");
+      return;
+    }
 
-        if (rescue) {
-          payload.invitation_code = authForm.invitation_code;
-        }
-
-        await api.post(
-          rescue
-            ? "/api/auth/register-rescue"
-            : "/api/auth/register",
-          payload
-        );
-
-        setAuthMode("login");
-        setAuthError("Registration successful! Please log in.");
-        setAuthForm({
-          full_name: "",
-          email: authForm.email,
-          password: "",
-          invitation_code: "",
-        });
-      } else {
-        const response = await api.post("/api/auth/login", {
-          email: authForm.email,
-          password: authForm.password,
-        });
-
-        const accessToken = response.data.access_token;
-        const loggedInUser = response.data.user;
-
-        setAuthToken(accessToken);
-        localStorage.setItem("ds_user", JSON.stringify(loggedInUser));
-
-        setToken(accessToken);
-        setUser(loggedInUser);
-        setLoading(true);
-        setNotice("Welcome to DisasterShield AI.");
-      }
-    } catch (error) {
-      console.error(error);
-      setAuthError(
-        error.response?.data?.detail ||
-        "Authentication failed. Please try again."
-      );
-    } finally {
-      setAuthLoading(false);
+    if (name.length < 2 || name.length > 50) {
+      setAuthError("Name must be between 2 and 50 characters.");
+      return;
     }
   }
+
+  setAuthLoading(true);
+
+  try {
+    if (authMode === "register" || authMode === "rescue-register") {
+      const rescue = authMode === "rescue-register";
+
+      const payload = {
+        full_name: authForm.full_name.trim(),
+        email: authForm.email,
+        password: authForm.password,
+      };
+
+      if (rescue) {
+        payload.invitation_code = authForm.invitation_code;
+      }
+
+      await api.post(
+        rescue
+          ? "/api/auth/register-rescue"
+          : "/api/auth/register",
+        payload
+      );
+
+      setAuthMode("login");
+      setAuthError("Registration successful! Please log in.");
+
+      setAuthForm({
+        full_name: "",
+        email: authForm.email,
+        password: "",
+        invitation_code: "",
+      });
+    } else {
+      const response = await api.post("/api/auth/login", {
+        email: authForm.email,
+        password: authForm.password,
+      });
+
+      const accessToken = response.data.access_token;
+      const loggedInUser = response.data.user;
+
+      setAuthToken(accessToken);
+      localStorage.setItem("ds_user", JSON.stringify(loggedInUser));
+
+      setToken(accessToken);
+      setUser(loggedInUser);
+      setLoading(true);
+      setNotice("Welcome to DisasterShield AI.");
+    }
+  } catch (error) {
+    console.error(error);
+
+    setAuthError(
+      error.response?.data?.detail ||
+      "Authentication failed. Please try again."
+    );
+  } finally {
+    setAuthLoading(false);
+  }
+}
 
   const analyzed = useMemo(
     () =>
@@ -905,16 +936,18 @@ export default function App() {
 
           <form className="auth-form" onSubmit={handleAuth}>
             {authMode !== "login" && (
-              <label>
-                Full Name
-                <input
-                  name="full_name"
-                  placeholder="Enter your full name"
-                  value={authForm.full_name}
-                  onChange={updateAuthForm}
-                  required
-                />
-              </label>
+              <input
+  name="full_name"
+  type="text"
+  placeholder="Enter your full name"
+  value={authForm.full_name}
+  onChange={updateAuthForm}
+  required
+  minLength={2}
+  maxLength={50}
+  pattern="[A-Za-z]+( [A-Za-z]+)*"
+  title="Only alphabets and spaces are allowed"
+/>
             )}
 
             <label>
