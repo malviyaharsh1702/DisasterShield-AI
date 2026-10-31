@@ -12,8 +12,7 @@ import {
 import "leaflet/dist/leaflet.css";
 import "./App.css";
 
-const API_URL =
-  import.meta.env.VITE_API_URL || "http://127.0.0.1:8001";
+const API_URL = import.meta.env.VITE_API_URL || "https://disastershield-ai-backend.onrender.com";
 
 const OFFLINE_STORAGE_KEY = "disasterShieldOfflineReports";
 

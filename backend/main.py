@@ -1,11 +1,12 @@
 
 import os
-import sqlite3
 import hashlib
 import secrets
 
+import psycopg
+from psycopg.rows import dict_row
+
 from ai_engine import analyze_incident, detect_duplicate
-from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -38,13 +39,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_PATH = Path(__file__).with_name("disastershield.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Set JWT_SECRET_KEY in your environment before deployment.
 SECRET_KEY = os.getenv(
     "JWT_SECRET_KEY",
     "LOCAL-ONLY-CHANGE-THIS-SECRET-BEFORE-DEPLOYMENT"
 )
+
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 12
 
@@ -52,13 +53,18 @@ security = HTTPBearer(auto_error=False)
 
 
 # --------------------------------------------------
-# DATABASE
+# POSTGRESQL DATABASE
 # --------------------------------------------------
 
 def get_connection():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15
+    )
 
 
 def initialize_database():
@@ -66,7 +72,7 @@ def initialize_database():
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 full_name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
@@ -77,27 +83,35 @@ def initialize_database():
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS incidents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
                 incident_type TEXT NOT NULL,
                 severity TEXT NOT NULL,
                 location TEXT NOT NULL,
-                latitude REAL,
-                longitude REAL,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
                 status TEXT NOT NULL DEFAULT 'Reported',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reporter_id BIGINT REFERENCES users(id),
+                assigned_team TEXT,
+                reviewed_by BIGINT,
+                priority_score DOUBLE PRECISION,
+                is_duplicate INTEGER NOT NULL DEFAULT 0,
+                duplicate_of BIGINT,
+                duplicate_similarity DOUBLE PRECISION,
+                ai_analysis_method TEXT
             )
         """)
 
         connection.execute("""
             CREATE TABLE IF NOT EXISTS resources (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 location TEXT NOT NULL,
-                latitude REAL,
-                longitude REAL,
+                latitude DOUBLE PRECISION,
+                longitude DOUBLE PRECISION,
                 total_capacity INTEGER NOT NULL DEFAULT 0,
                 available_capacity INTEGER NOT NULL DEFAULT 0,
                 contact TEXT,
@@ -105,31 +119,6 @@ def initialize_database():
                 updated_at TEXT NOT NULL
             )
         """)
-
-        # Safe migration: add new columns without deleting old records.
-        columns = {
-            row["name"]
-            for row in connection.execute(
-                "PRAGMA table_info(incidents)"
-            ).fetchall()
-        }
-
-        migrations = {
-    "reporter_id": "INTEGER REFERENCES users(id)",
-    "assigned_team": "TEXT",
-    "reviewed_by": "INTEGER",
-    "priority_score": "REAL",
-    "is_duplicate": "INTEGER NOT NULL DEFAULT 0",
-    "duplicate_of": "INTEGER",
-    "duplicate_similarity": "REAL",
-    "ai_analysis_method": "TEXT"
-}
-
-        for column, definition in migrations.items():
-            if column not in columns:
-                connection.execute(
-                    f"ALTER TABLE incidents ADD COLUMN {column} {definition}"
-                )
 
 
 initialize_database()
@@ -174,6 +163,7 @@ class StatusUpdate(BaseModel):
 class AssignmentRequest(BaseModel):
     assigned_team: str = Field(min_length=2, max_length=100)
 
+
 class ResourceCreate(BaseModel):
     name: str = Field(min_length=2, max_length=150)
     resource_type: str
@@ -188,6 +178,16 @@ class ResourceCreate(BaseModel):
 class ResourceUpdate(BaseModel):
     available_capacity: int = Field(ge=0)
     status: str
+
+
+class ResourceDetailsUpdate(BaseModel):
+    name: str = Field(min_length=2, max_length=150)
+    resource_type: str
+    location: str = Field(min_length=2, max_length=250)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    contact: Optional[str] = None
+    total_capacity: int = Field(ge=0)
 
 
 # --------------------------------------------------
@@ -240,7 +240,11 @@ def create_access_token(user_id: int, role: str):
         "exp": expires
     }
 
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(
+        payload,
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
 
 
 def get_current_user(
@@ -276,7 +280,11 @@ def get_current_user(
 
     with get_connection() as connection:
         user = connection.execute(
-            "SELECT id, full_name, email, role FROM users WHERE id = ?",
+            """
+            SELECT id, full_name, email, role
+            FROM users
+            WHERE id = %s
+            """,
             (user_id,)
         ).fetchone()
 
@@ -286,7 +294,7 @@ def get_current_user(
             detail="Account not found or role changed"
         )
 
-    return dict(user)
+    return user
 
 
 def require_role(required_role: str):
@@ -333,7 +341,7 @@ def register_citizen(data: CitizenRegister):
     with get_connection() as connection:
 
         existing = connection.execute(
-            "SELECT id FROM users WHERE email = ?",
+            "SELECT id FROM users WHERE email = %s",
             (email,)
         ).fetchone()
 
@@ -343,12 +351,13 @@ def register_citizen(data: CitizenRegister):
                 detail="Email is already registered"
             )
 
-        cursor = connection.execute(
+        user = connection.execute(
             """
             INSERT INTO users (
                 full_name, email, password_hash, role, created_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 full_name,
@@ -357,9 +366,9 @@ def register_citizen(data: CitizenRegister):
                 "citizen",
                 datetime.now(timezone.utc).isoformat()
             )
-        )
+        ).fetchone()
 
-        user_id = cursor.lastrowid
+        user_id = user["id"]
 
     return {
         "message": "Citizen account created successfully",
@@ -369,7 +378,7 @@ def register_citizen(data: CitizenRegister):
 
 
 # --------------------------------------------------
-# AUTHORIZED RESCUE REGISTRATION
+# RESCUE REGISTRATION
 # --------------------------------------------------
 
 @app.post("/api/auth/register-rescue", status_code=201)
@@ -401,7 +410,7 @@ def register_rescue(data: RescueRegister):
     with get_connection() as connection:
 
         existing = connection.execute(
-            "SELECT id FROM users WHERE email = ?",
+            "SELECT id FROM users WHERE email = %s",
             (email,)
         ).fetchone()
 
@@ -411,12 +420,13 @@ def register_rescue(data: RescueRegister):
                 detail="Email is already registered"
             )
 
-        cursor = connection.execute(
+        user = connection.execute(
             """
             INSERT INTO users (
                 full_name, email, password_hash, role, created_at
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 full_name,
@@ -425,9 +435,9 @@ def register_rescue(data: RescueRegister):
                 "rescue",
                 datetime.now(timezone.utc).isoformat()
             )
-        )
+        ).fetchone()
 
-        user_id = cursor.lastrowid
+        user_id = user["id"]
 
     return {
         "message": "Rescue account created successfully",
@@ -447,7 +457,7 @@ def login(data: LoginRequest):
 
     with get_connection() as connection:
         user = connection.execute(
-            "SELECT * FROM users WHERE email = ?",
+            "SELECT * FROM users WHERE email = %s",
             (email,)
         ).fetchone()
 
@@ -478,7 +488,7 @@ def login(data: LoginRequest):
 
 
 # --------------------------------------------------
-# CURRENT LOGGED-IN USER
+# CURRENT USER
 # --------------------------------------------------
 
 @app.get("/api/auth/me")
@@ -499,31 +509,37 @@ def dashboard(user=Depends(get_current_user)):
             where_clause = ""
             parameters = ()
         else:
-            where_clause = "WHERE reporter_id = ?"
+            where_clause = "WHERE reporter_id = %s"
             parameters = (user["id"],)
 
         total = connection.execute(
-            f"SELECT COUNT(*) FROM incidents {where_clause}",
+            f"""
+            SELECT COUNT(*) AS count
+            FROM incidents
+            {where_clause}
+            """,
             parameters
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         critical = connection.execute(
             f"""
-            SELECT COUNT(*) FROM incidents
+            SELECT COUNT(*) AS count
+            FROM incidents
             {where_clause}
-            {"AND" if where_clause else "WHERE"} severity = ?
+            {"AND" if where_clause else "WHERE"} severity = %s
             """,
             parameters + ("Critical",)
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
         resolved = connection.execute(
             f"""
-            SELECT COUNT(*) FROM incidents
+            SELECT COUNT(*) AS count
+            FROM incidents
             {where_clause}
-            {"AND" if where_clause else "WHERE"} status = ?
+            {"AND" if where_clause else "WHERE"} status = %s
             """,
             parameters + ("Resolved",)
-        ).fetchone()[0]
+        ).fetchone()["count"]
 
     return {
         "total_incidents": total,
@@ -535,7 +551,6 @@ def dashboard(user=Depends(get_current_user)):
 
 # --------------------------------------------------
 # GET INCIDENTS
-# Citizens see their reports; rescue sees all reports.
 # --------------------------------------------------
 
 @app.get("/api/incidents")
@@ -551,13 +566,14 @@ def get_incidents(user=Depends(get_current_user)):
             rows = connection.execute(
                 """
                 SELECT * FROM incidents
-                WHERE reporter_id = ?
+                WHERE reporter_id = %s
                 ORDER BY id DESC
                 """,
                 (user["id"],)
             ).fetchall()
 
-    return [dict(row) for row in rows]
+    return rows
+
 
 # --------------------------------------------------
 # RESCUE PRIORITY INCIDENTS
@@ -573,29 +589,29 @@ def get_priority_incidents(user=Depends(get_rescue)):
             FROM incidents
             ORDER BY
                 is_duplicate ASC,
-                priority_score DESC,
+                priority_score DESC NULLS LAST,
                 id DESC
             """
         ).fetchall()
 
     return {
         "total": len(rows),
-        "incidents": [dict(row) for row in rows]
+        "incidents": rows
     }
 
-# --------------------------------------------------
-# CITIZEN CREATES INCIDENT
-# --------------------------------------------------
 
+# --------------------------------------------------
+# CREATE INCIDENT
+# --------------------------------------------------
 
 @app.post("/api/incidents", status_code=201)
 def create_incident(
     incident: Incident,
     user=Depends(get_citizen)
 ):
+
     with get_connection() as connection:
 
-        # Step 1: Run AI analysis
         analysis = analyze_incident(
             incident.title,
             incident.description,
@@ -603,7 +619,6 @@ def create_incident(
             incident.severity
         )
 
-        # Step 2: Fetch existing incidents for duplicate checking
         existing_incidents = connection.execute(
             """
             SELECT id, title, description, location
@@ -613,7 +628,6 @@ def create_incident(
             """
         ).fetchall()
 
-        # Step 3: Detect possible duplicate
         duplicate_result = detect_duplicate(
             incident.title,
             incident.description,
@@ -621,8 +635,7 @@ def create_incident(
             existing_incidents
         )
 
-        # Step 4: Save AI results
-        cursor = connection.execute(
+        saved_incident = connection.execute(
             """
             INSERT INTO incidents (
                 title,
@@ -641,7 +654,11 @@ def create_incident(
                 duplicate_similarity,
                 ai_analysis_method
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING *
             """,
             (
                 incident.title,
@@ -660,25 +677,18 @@ def create_incident(
                 duplicate_result["similarity"],
                 analysis["analysis_method"]
             )
-        )
-
-        incident_id = cursor.lastrowid
-
-        row = connection.execute(
-            "SELECT * FROM incidents WHERE id = ?",
-            (incident_id,)
         ).fetchone()
 
     return {
         "message": "Incident saved and analyzed successfully",
-        "incident": dict(row),
+        "incident": saved_incident,
         "ai_analysis": analysis,
         "duplicate_check": duplicate_result
     }
 
 
 # --------------------------------------------------
-# RESCUE TEAM UPDATES INCIDENT STATUS
+# UPDATE INCIDENT STATUS
 # --------------------------------------------------
 
 @app.patch("/api/incidents/{incident_id}/status")
@@ -707,8 +717,8 @@ def update_incident_status(
         result = connection.execute(
             """
             UPDATE incidents
-            SET status = ?, reviewed_by = ?
-            WHERE id = ?
+            SET status = %s, reviewed_by = %s
+            WHERE id = %s
             """,
             (data.status, user["id"], incident_id)
         )
@@ -727,7 +737,7 @@ def update_incident_status(
 
 
 # --------------------------------------------------
-# RESCUE TEAM ASSIGNMENT
+# ASSIGN RESCUE TEAM
 # --------------------------------------------------
 
 @app.patch("/api/incidents/{incident_id}/assign")
@@ -742,8 +752,8 @@ def assign_rescue_team(
         result = connection.execute(
             """
             UPDATE incidents
-            SET assigned_team = ?, status = ?
-            WHERE id = ?
+            SET assigned_team = %s, status = %s
+            WHERE id = %s
             """,
             (
                 data.assigned_team.strip(),
@@ -764,8 +774,9 @@ def assign_rescue_team(
         "assigned_team": data.assigned_team
     }
 
+
 # --------------------------------------------------
-# HOSPITAL & SHELTER RESOURCE MANAGEMENT
+# GET RESOURCES
 # --------------------------------------------------
 
 @app.get("/api/resources")
@@ -781,11 +792,14 @@ def get_resources(user=Depends(get_current_user)):
 
     return {
         "total": len(rows),
-        "resources": [dict(row) for row in rows]
+        "resources": rows
     }
 
 
-# RESCUE TEAM ADDS A RESOURCE
+# --------------------------------------------------
+# ADD RESOURCE
+# --------------------------------------------------
+
 @app.post("/api/resources", status_code=201)
 def add_resource(
     data: ResourceCreate,
@@ -807,7 +821,8 @@ def add_resource(
         )
 
     with get_connection() as connection:
-        cursor = connection.execute(
+
+        resource = connection.execute(
             """
             INSERT INTO resources (
                 name, resource_type, location,
@@ -815,7 +830,8 @@ def add_resource(
                 total_capacity, available_capacity,
                 contact, status, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 data.name.strip(),
@@ -829,9 +845,9 @@ def add_resource(
                 "Available" if data.available_capacity > 0 else "Full",
                 datetime.now(timezone.utc).isoformat()
             )
-        )
+        ).fetchone()
 
-        resource_id = cursor.lastrowid
+        resource_id = resource["id"]
 
     return {
         "message": "Resource added successfully",
@@ -839,7 +855,9 @@ def add_resource(
     }
 
 
-# RESCUE TEAM UPDATES RESOURCE AVAILABILITY
+# --------------------------------------------------
+# UPDATE RESOURCE AVAILABILITY
+# --------------------------------------------------
 
 @app.patch("/api/resources/{resource_id}")
 def update_resource(
@@ -847,6 +865,7 @@ def update_resource(
     data: ResourceUpdate,
     user=Depends(get_rescue)
 ):
+
     allowed_statuses = (
         "Available",
         "Limited",
@@ -861,12 +880,12 @@ def update_resource(
         )
 
     with get_connection() as connection:
-        # Check whether resource exists and get its total capacity
+
         resource = connection.execute(
             """
             SELECT total_capacity
             FROM resources
-            WHERE id = ?
+            WHERE id = %s
             """,
             (resource_id,)
         ).fetchone()
@@ -886,10 +905,10 @@ def update_resource(
         connection.execute(
             """
             UPDATE resources
-            SET available_capacity = ?,
-                status = ?,
-                updated_at = ?
-            WHERE id = ?
+            SET available_capacity = %s,
+                status = %s,
+                updated_at = %s
+            WHERE id = %s
             """,
             (
                 data.available_capacity,
@@ -905,7 +924,10 @@ def update_resource(
     }
 
 
-# RESCUE TEAM DELETES A RESOURCE
+# --------------------------------------------------
+# DELETE RESOURCE
+# --------------------------------------------------
+
 @app.delete("/api/resources/{resource_id}")
 def delete_resource(
     resource_id: int,
@@ -913,8 +935,9 @@ def delete_resource(
 ):
 
     with get_connection() as connection:
+
         result = connection.execute(
-            "DELETE FROM resources WHERE id = ?",
+            "DELETE FROM resources WHERE id = %s",
             (resource_id,)
         )
 
@@ -928,17 +951,10 @@ def delete_resource(
         "message": "Resource deleted successfully",
         "resource_id": resource_id
     }
-class ResourceDetailsUpdate(BaseModel):
-    name: str = Field(min_length=2, max_length=150)
-    resource_type: str
-    location: str = Field(min_length=2, max_length=250)
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    contact: Optional[str] = None
-    total_capacity: int = Field(ge=0)
 
-    # --------------------------------------------------
-# RESCUE TEAM EDITS RESOURCE DETAILS
+
+# --------------------------------------------------
+# EDIT RESOURCE DETAILS
 # --------------------------------------------------
 
 @app.put("/api/resources/{resource_id}")
@@ -947,6 +963,7 @@ def edit_resource(
     data: ResourceDetailsUpdate,
     user=Depends(get_rescue)
 ):
+
     resource_type = data.resource_type.strip().lower()
 
     if resource_type not in ("hospital", "shelter"):
@@ -962,11 +979,12 @@ def edit_resource(
         )
 
     with get_connection() as connection:
+
         resource = connection.execute(
             """
             SELECT available_capacity
             FROM resources
-            WHERE id = ?
+            WHERE id = %s
             """,
             (resource_id,)
         ).fetchone()
@@ -983,15 +1001,15 @@ def edit_resource(
         connection.execute(
             """
             UPDATE resources
-            SET name = ?,
-                resource_type = ?,
-                location = ?,
-                latitude = ?,
-                longitude = ?,
-                contact = ?,
-                total_capacity = ?,
-                updated_at = ?
-            WHERE id = ?
+            SET name = %s,
+                resource_type = %s,
+                location = %s,
+                latitude = %s,
+                longitude = %s,
+                contact = %s,
+                total_capacity = %s,
+                updated_at = %s
+            WHERE id = %s
             """,
             (
                 data.name.strip(),

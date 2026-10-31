@@ -34,15 +34,21 @@ DISASTER_KEYWORDS = {
 }
 
 
+def contains_keyword(text, keyword):
+    pattern = r"(?<!\w)" + re.escape(keyword.lower()) + r"(?!\w)"
+    return re.search(pattern, text) is not None
+
+
 def classify_disaster(text, submitted_type="Other"):
-    text = text.lower()
+    text = str(text or "").lower()
 
-    scores = {}
-
-    for disaster, keywords in DISASTER_KEYWORDS.items():
-        scores[disaster] = sum(
-            1 for keyword in keywords if keyword in text
+    scores = {
+        disaster: sum(
+            1 for keyword in keywords
+            if contains_keyword(text, keyword)
         )
+        for disaster, keywords in DISASTER_KEYWORDS.items()
+    }
 
     best_type = max(scores, key=scores.get)
 
@@ -84,28 +90,25 @@ SEVERITY_KEYWORDS = {
 
 
 def detect_severity(text, submitted_severity="Medium"):
-    text = text.lower()
+    text = str(text or "").lower()
 
     detected = "Low"
 
     for severity in ["Critical", "High", "Medium", "Low"]:
         if any(
-            keyword in text
+            contains_keyword(text, keyword)
             for keyword in SEVERITY_KEYWORDS[severity]
         ):
             detected = severity
             break
 
-    # Never reduce the severity submitted by the citizen.
-    submitted = submitted_severity.title()
+    submitted = str(submitted_severity or "Medium").title()
 
     if submitted not in SEVERITY_LEVELS:
         submitted = "Medium"
 
-    if (
-        SEVERITY_LEVELS[submitted]
-        > SEVERITY_LEVELS[detected]
-    ):
+    # Never reduce citizen-submitted severity.
+    if SEVERITY_LEVELS[submitted] > SEVERITY_LEVELS[detected]:
         detected = submitted
 
     return detected
@@ -116,7 +119,6 @@ def detect_severity(text, submitted_severity="Medium"):
 # -----------------------------------------
 
 def calculate_priority(severity, disaster_type, text):
-
     score = {
         "Low": 20,
         "Medium": 40,
@@ -124,7 +126,7 @@ def calculate_priority(severity, disaster_type, text):
         "Critical": 85
     }.get(severity, 40)
 
-    text = text.lower()
+    text = str(text or "").lower()
 
     urgent_keywords = [
         "trapped", "missing", "injured", "children",
@@ -133,7 +135,8 @@ def calculate_priority(severity, disaster_type, text):
     ]
 
     urgency_bonus = sum(
-        3 for keyword in urgent_keywords if keyword in text
+        3 for keyword in urgent_keywords
+        if contains_keyword(text, keyword)
     )
 
     score += min(urgency_bonus, 15)
@@ -148,23 +151,18 @@ def calculate_priority(severity, disaster_type, text):
 # COMPLETE INCIDENT ANALYSIS
 # -----------------------------------------
 
-def analyze_incident(
-    title,
-    description,
-    incident_type,
-    severity
-):
+def analyze_incident(title, description, incident_type, severity):
+    title = str(title or "")
+    description = str(description or "")
 
     text = f"{title} {description}"
 
     predicted_type = classify_disaster(
-        text,
-        incident_type
+        text, incident_type
     )
 
     predicted_severity = detect_severity(
-        text,
-        severity
+        text, severity
     )
 
     priority = calculate_priority(
@@ -186,16 +184,20 @@ def analyze_incident(
 # -----------------------------------------
 
 def normalize_text(text):
-    text = text.lower()
+    text = str(text or "").lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return " ".join(text.split())
 
 
 def similarity_score(text1, text2):
+    text1 = normalize_text(text1)
+    text2 = normalize_text(text2)
+
+    if not text1 or not text2:
+        return 0.0
+
     return SequenceMatcher(
-        None,
-        normalize_text(text1),
-        normalize_text(text2)
+        None, text1, text2
     ).ratio()
 
 
@@ -205,42 +207,41 @@ def detect_duplicate(
     new_location,
     existing_incidents
 ):
+    new_text = f"{new_title or ''} {new_description or ''}"
+    current_location = normalize_text(new_location)
 
-    new_text = f"{new_title} {new_description}"
+    best_match = None
+    best_similarity = 0.0
 
     for incident in existing_incidents:
-
         old_location = normalize_text(
-            incident["location"]
+            incident.get("location", "")
         )
 
-        current_location = normalize_text(
-            new_location
-        )
-
-        # Compare reports only when their locations match.
-        if old_location != current_location:
+        # Compare only reports from the same normalized location.
+        if not current_location or old_location != current_location:
             continue
 
         old_text = (
-            f"{incident['title']} "
-            f"{incident['description']}"
+            f"{incident.get('title', '')} "
+            f"{incident.get('description', '')}"
         )
 
-        similarity = similarity_score(
-            new_text,
-            old_text
-        )
+        similarity = similarity_score(new_text, old_text)
 
-        if similarity >= 0.65:
-            return {
-                "is_duplicate": True,
-                "duplicate_of": incident["id"],
-                "similarity": round(similarity * 100, 2)
-            }
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_match = incident
+
+    if best_match and best_similarity >= 0.65:
+        return {
+            "is_duplicate": True,
+            "duplicate_of": best_match.get("id"),
+            "similarity": round(best_similarity * 100, 2)
+        }
 
     return {
         "is_duplicate": False,
         "duplicate_of": None,
-        "similarity": 0
+        "similarity": round(best_similarity * 100, 2)
     }
